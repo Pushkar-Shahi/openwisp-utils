@@ -55,14 +55,16 @@ jobs:
           ref: master
           path: trusted_scripts
 
-      - name: Checkout PR Code
-        uses: actions/checkout@v7
-        with:
-          repository: ${{ inputs.head_repo }}
-          ref: ${{ inputs.head_sha }}
-          path: pr_code
-          fetch-depth: 1
-          submodules: false
+      - name: Fetch PR Diff
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          PR_NUM: ${{ inputs.pr_number }}
+          REPO: ${{ inputs.base_repo }}
+        run: |
+          echo "Fetching diff for PR #$PR_NUM in $REPO..."
+          if ! gh pr diff "$PR_NUM" --repo "$REPO" > pr_diff.txt; then
+            echo "Could not fetch PR diff." > pr_diff.txt
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v7

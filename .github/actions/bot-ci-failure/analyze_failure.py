@@ -215,7 +215,40 @@ def get_error_logs():
         return f"Error reading logs: {e}", False, False
 
 
-def get_repo_context(base_dir="pr_code", max_chars=500000):
+def _filter_sensitive_diff(diff_text):
+    sensitive_exts = {".pem", ".key", ".crt", ".p12"}
+    chunks = re.split(r"(?=^diff --git )", diff_text, flags=re.MULTILINE)
+    filtered = []
+    for chunk in chunks:
+        match = re.search(r"^diff --git a/(\S+) b/(\S+)", chunk, flags=re.MULTILINE)
+        if match:
+            path = match.group(2)
+            filename = os.path.basename(path)
+            ext = os.path.splitext(filename)[1].lower()
+            if filename.startswith(".env") or ext in sensitive_exts:
+                continue
+        filtered.append(chunk)
+    return "".join(filtered)
+
+
+def get_repo_context(base_dir="pr_code", diff_file="pr_diff.txt", max_chars=500000):
+    if os.path.isfile(diff_file):
+        try:
+            with open(diff_file, "r", encoding="utf-8") as f:
+                diff_content = f.read().strip()
+            if diff_content and diff_content != "Could not fetch PR diff.":
+                diff_content = _filter_sensitive_diff(diff_content)
+                if not diff_content:
+                    return "No relevant diff changes found."
+                if len(diff_content) > max_chars:
+                    return (
+                        diff_content[:max_chars]
+                        + "\n\n... [ SYSTEM WARNING: REPO CONTEXT TRUNCATED DUE TO SIZE LIMITS. ] ..."
+                    )
+                return diff_content
+        except (UnicodeDecodeError, OSError):
+            pass
+
     if not os.path.exists(base_dir):
         return "No repository context available."
     ignore_dirs = {

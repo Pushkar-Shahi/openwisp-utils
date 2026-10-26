@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from analyze_failure import (  # noqa: E402
     _extract_failed_tests,
+    _filter_sensitive_diff,
     _fix_markdown_rendering,
     _is_transient_failure,
     _normalize_for_dedup,
@@ -33,6 +34,17 @@ class TestReusableWorkflow(unittest.TestCase):
             "repos/$REPO/actions/jobs/$JOB_ID/logs > job_logs.txt"
         )
         self.assertIn(fetch_command, workflow.read_text())
+
+    def test_fetches_pr_diff_instead_of_checking_out_fork(self):
+        workflow = (
+            Path(__file__).resolve().parents[3]
+            / ".github/workflows/reusable-bot-ci-failure.yml"
+        )
+        workflow_text = workflow.read_text()
+        self.assertIn(
+            'gh pr diff "$PR_NUM" --repo "$REPO" > pr_diff.txt', workflow_text
+        )
+        self.assertNotIn("repository: ${{ inputs.head_repo }}", workflow_text)
 
 
 class TestGetErrorLogs(unittest.TestCase):
@@ -156,6 +168,149 @@ class TestGetRepoContext(unittest.TestCase):
             self.assertNotIn("jquery.js", result)
             self.assertNotIn("print('ignored')", result)
             self.assertNotIn("massive library ignored", result)
+
+    def test_reads_pr_diff_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diff_path = os.path.join(temp_dir, "pr_diff.txt")
+            sample_diff = (
+                "diff --git a/app/views.py b/app/views.py\n"
+                "--- a/app/views.py\n"
+                "+++ b/app/views.py\n"
+                "@@ -1,3 +1,4 @@\n"
+                "+def new_view(): pass\n"
+            )
+            with open(diff_path, "w") as f:
+                f.write(sample_diff)
+            result = get_repo_context(base_dir=temp_dir, diff_file=diff_path)
+            self.assertEqual(result, sample_diff.strip())
+
+    def test_filters_sensitive_files_from_diff(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diff_path = os.path.join(temp_dir, "pr_diff.txt")
+            sensitive_diff = (
+                "diff --git a/.env b/.env\n"
+                "--- a/.env\n"
+                "+++ b/.env\n"
+                "@@ -1 +1 @@\n"
+                "+SECRET_KEY=12345\n"
+                "diff --git a/app/views.py b/app/views.py\n"
+                "--- a/app/views.py\n"
+                "+++ b/app/views.py\n"
+                "@@ -1 +1 @@\n"
+                "+def hello(): pass\n"
+            )
+            with open(diff_path, "w") as f:
+                f.write(sensitive_diff)
+            result = get_repo_context(base_dir=temp_dir, diff_file=diff_path)
+            self.assertNotIn("SECRET_KEY", result)
+            self.assertIn("def hello(): pass", result)
+
+    def test_returns_no_relevant_diff_when_all_filtered(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diff_path = os.path.join(temp_dir, "pr_diff.txt")
+            sensitive_diff = (
+                "diff --git a/.env b/.env\n"
+                "--- a/.env\n"
+                "+++ b/.env\n"
+                "@@ -1 +1 @@\n"
+                "+SECRET_KEY=12345\n"
+            )
+            with open(diff_path, "w") as f:
+                f.write(sensitive_diff)
+            result = get_repo_context(base_dir=temp_dir, diff_file=diff_path)
+            self.assertEqual(result, "No relevant diff changes found.")
+
+    def test_truncates_diff_when_max_chars_exceeded(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diff_path = os.path.join(temp_dir, "pr_diff.txt")
+            large_diff = "diff --git a/app/views.py b/app/views.py\n" + "+" * 200
+            with open(diff_path, "w") as f:
+                f.write(large_diff)
+            result = get_repo_context(
+                base_dir=temp_dir, diff_file=diff_path, max_chars=50
+            )
+            self.assertIn("SYSTEM WARNING: REPO CONTEXT TRUNCATED", result)
+            self.assertTrue(result.startswith(large_diff[:50]))
+
+    def test_falls_back_to_pr_code_when_diff_fetch_failed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diff_path = os.path.join(temp_dir, "pr_diff.txt")
+            with open(diff_path, "w") as f:
+                f.write("Could not fetch PR diff.\n")
+            code_dir = os.path.join(temp_dir, "pr_code")
+            os.makedirs(code_dir)
+            with open(os.path.join(code_dir, "app.py"), "w") as f:
+                f.write("print('fallback')")
+            result = get_repo_context(base_dir=code_dir, diff_file=diff_path)
+            self.assertIn('<file path="app.py">', result)
+            self.assertIn("print('fallback')", result)
+
+    def test_falls_back_to_pr_code_when_diff_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            code_dir = os.path.join(temp_dir, "pr_code")
+            os.makedirs(code_dir)
+            with open(os.path.join(code_dir, "app.py"), "w") as f:
+                f.write("print('direct')")
+            result = get_repo_context(
+                base_dir=code_dir,
+                diff_file=os.path.join(temp_dir, "nonexistent.txt"),
+            )
+            self.assertIn('<file path="app.py">', result)
+            self.assertIn("print('direct')", result)
+
+    def test_handles_unicode_decode_error_in_diff(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diff_path = os.path.join(temp_dir, "pr_diff.txt")
+            with open(diff_path, "wb") as f:
+                f.write(b"\xff\xfe\x00\x00invalid")
+            code_dir = os.path.join(temp_dir, "pr_code")
+            os.makedirs(code_dir)
+            with open(os.path.join(code_dir, "app.py"), "w") as f:
+                f.write("print('recovered')")
+            result = get_repo_context(base_dir=code_dir, diff_file=diff_path)
+            self.assertIn("print('recovered')", result)
+
+
+class TestFilterSensitiveDiff(unittest.TestCase):
+    """Tests for _filter_sensitive_diff helper."""
+
+    def test_filters_env_and_key_files(self):
+        diff = (
+            "diff --git a/.env b/.env\n"
+            "--- a/.env\n"
+            "+++ b/.env\n"
+            "@@ -1 +1 @@\n"
+            "+SECRET=123\n"
+            "diff --git a/.env.prod b/.env.prod\n"
+            "--- a/.env.prod\n"
+            "+++ b/.env.prod\n"
+            "@@ -1 +1 @@\n"
+            "+SECRET=prod\n"
+            "diff --git a/certs/server.key b/certs/server.key\n"
+            "--- a/certs/server.key\n"
+            "+++ b/certs/server.key\n"
+            "@@ -1 +1 @@\n"
+            "+CERT_KEY\n"
+            "diff --git a/certs/server.crt b/certs/server.crt\n"
+            "--- a/certs/server.crt\n"
+            "+++ b/certs/server.crt\n"
+            "@@ -1 +1 @@\n"
+            "+CRT_DATA\n"
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1 +1 @@\n"
+            "+print('safe')\n"
+        )
+        filtered = _filter_sensitive_diff(diff)
+        self.assertNotIn(".env", filtered)
+        self.assertNotIn("server.key", filtered)
+        self.assertNotIn("server.crt", filtered)
+        self.assertIn("app.py", filtered)
+        self.assertIn("print('safe')", filtered)
+
+    def test_handles_empty_diff(self):
+        self.assertEqual(_filter_sensitive_diff(""), "")
 
 
 class TestExtractFailedTests(unittest.TestCase):
